@@ -1,0 +1,25 @@
+spring:
+  application:
+    name: api
+  threads:
+    virtual:
+      enabled: true
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      # 기본값(60초)을 쓰면 Redis 장애 시 요청이 오래 매달리므로 짧게 둔다
+      timeout: 500ms
+
+server:
+  port: 8080
+  tomcat:
+    accept-count: 2000
+    max-connections: 10000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info

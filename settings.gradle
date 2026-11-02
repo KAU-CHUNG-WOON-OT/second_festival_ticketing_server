@@ -1,0 +1,3 @@
+rootProject.name = 'second_festival_ticketing_server'
+
+include 'api', 'archiver'

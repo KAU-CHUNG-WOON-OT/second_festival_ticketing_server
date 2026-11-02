@@ -1,0 +1,7 @@
+// Redis Stream 발급 내역 → MySQL 저장 워커
+dependencies {
+	implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+	runtimeOnly 'com.mysql:mysql-connector-j'
+	testImplementation 'org.springframework.boot:spring-boot-starter-data-jpa-test'
+	testImplementation 'org.testcontainers:testcontainers-mysql'
+}
