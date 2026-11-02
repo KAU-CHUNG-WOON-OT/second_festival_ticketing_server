@@ -1,4 +1,7 @@
 spring:
+  # 로컬 개발: 루트의 .env를 읽는다 (없으면 무시, 배포 환경은 실제 환경변수 사용)
+  config:
+    import: optional:file:../.env[.properties],optional:file:.env[.properties]
   application:
     name: archiver
   threads:
