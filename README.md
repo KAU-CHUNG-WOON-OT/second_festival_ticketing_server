@@ -19,7 +19,7 @@ ALB (HTTPS) → Spring Boot api (EC2 × 2) → Redis (EC2, Primary + Replica)
 ## 기술 스택
 
 - Java 21, Spring Boot 4, Gradle (멀티 모듈: `api`, `archiver`)
-- Redis 7 (Lua, Streams, Pub/Sub), MySQL 8
+- Redis 7 (Lua, Streams), MySQL 8
 - Terraform, Docker, Testcontainers, k6
 
 ## 로컬 실행

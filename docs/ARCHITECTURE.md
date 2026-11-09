@@ -1,20 +1,18 @@
-# Festival Ticketing — Redis on EC2 아키텍처 (초안 v0.1)
+# Festival Ticketing 아키텍처 (Redis on EC2)
 
-> 상태: **논의 중** — 아래 "결정 필요 사항"이 정해지면 Terraform/애플리케이션 코드 작성에 들어갑니다.
-> 기존 서버리스 버전: `~/Desktop/항공대/4-1/축제서비스/festival_ticketing`
+> 2학기 축제 티켓팅 서버의 설계 문서입니다. API는 [API.md](API.md)를 참고합니다.
 
 ---
 
-## 1. 기존 서버리스 구조 요약
+## 1. 이전 서버리스 구조와 한계
 
 ```
-Client ──HTTPS──▶ API Gateway (REST, ticket.chungwoon-festival.com)
-                     │ AWS_PROXY
+Client ──HTTPS──▶ API Gateway
                      ▼
-               Lambda enqueue (JWT 검증, 시간대 검증)  ── Provisioned Concurrency 500~900
+               Lambda enqueue (JWT 검증, 시간대 검증)
                      │ SendMessage (MessageGroupId = user_id % 3, DedupId = user_id)
                      ▼
-               SQS FIFO (High Throughput)
+               SQS FIFO
                      │ batch 10, reserved concurrency 3
                      ▼
                Lambda dequeue
@@ -22,193 +20,237 @@ Client ──HTTPS──▶ API Gateway (REST, ticket.chungwoon-festival.com)
                      └─ DynamoDB ticket  (PutItem user_id, rank, ISSUED)
 ```
 
-관찰된 한계 (코드 + 부하테스트 결과 기준)
-
-| 문제 | 근거 |
+| 한계 | 내용 |
 |---|---|
-| **Lambda 동시성 한도로 429 발생** | `loadtest/summary.json`: 3000 요청 중 1389 실패, `failures.log`에 `429 Too Many Requests` 다수 |
-| **비동기라 사용자가 결과를 즉시 모름** | enqueue는 "accepted"만 반환, 결과 조회용 `lambda/query/handler.py`는 비어 있음 |
-| **DynamoDB 단일 카운터 아이템 = 핫 키** | 모든 발급이 `counter_id = ticket_counter` 한 아이템에 몰림 (파티션당 쓰기 ~1000 WCU/s 한도) |
-| **처리 직렬화** | FIFO 그룹 3개 + reserved concurrency 3 → 발급 처리량이 소비자 3개에 묶임 |
-| **콜드스타트/비용 관리 부담** | 축제 당일 Provisioned Concurrency를 수동으로 켜고 꺼야 함 |
-| **중복 요청 방어가 5분 dedup 윈도우 의존** | SQS dedup은 5분만 유효, 이후 재요청은 counter를 또 증가시킬 수 있음 (ticket 테이블 PutItem은 덮어씀 → **표 수 누수 가능**) |
+| 동시성 한도 | 부하 테스트에서 3000 요청 중 1389건 실패, `429 Too Many Requests` 다수 |
+| 비동기 응답 | 사용자는 "접수됨"만 받고 결과를 바로 알 수 없음 |
+| 단일 카운터 | 모든 발급이 DynamoDB 아이템 하나에 집중 (파티션당 쓰기 약 1000 WCU/s) |
+| 처리 경로 직렬화 | FIFO 그룹 3개와 소비자 3개에 발급 처리량이 묶임 |
+| 수동 용량 관리 | 행사 당일 Provisioned Concurrency를 직접 켜고 꺼야 함 |
+| 중복 방지 기간 | SQS 중복 제거는 5분만 유효. 이후 재요청은 카운터를 다시 증가시킬 수 있음 |
 
 ---
 
-## 2. 제안 아키텍처 (Redis on EC2)
+## 2. 전체 구조
 
-핵심 아이디어: **큐를 없애고, Redis Lua 스크립트 한 번으로 "중복 확인 + 재고 확인 + 발급"을 원자적으로 처리**하여 요청 안에서 바로 결과(순번)를 돌려준다.
+요청 경로에 큐를 두지 않고, **Redis Lua 스크립트 1회로 중복 확인, 재고 확인, 발급을 원자적으로 처리**해 결과를 즉시 응답합니다.
 
 ```mermaid
 flowchart LR
-    U[Client<br/>www.chungwoon-festival.com] -->|HTTPS| ALB
+    U[Client] -->|HTTPS| ALB
 
-    subgraph VPC [VPC 10.0.0.0/16 · ap-northeast-2]
+    subgraph VPC [VPC · ap-northeast-2]
         subgraph PUB [Public Subnet a/c]
-            ALB[ALB + ACM<br/>ticket.chungwoon-festival.com]
+            ALB[ALB + ACM]
+            NAT[NAT Gateway]
         end
-        subgraph APP [Private Subnet a/c — App]
-            A1[EC2 App #1<br/>Spring Boot 3 / Java 21]
-            A2[EC2 App #2<br/>Spring Boot 3 / Java 21]
+        subgraph APP [Private Subnet a/c · App]
+            A1[api #1<br/>Spring Boot]
+            A2[api #2<br/>Spring Boot]
         end
-        subgraph DATA [Private Subnet a/c — Data]
-            R1[(EC2 Redis Primary<br/>AOF always)]
-            R2[(EC2 Redis Replica)]
+        subgraph DATA [Private Subnet a/c · Data]
+            R1[(Redis Primary)]
+            R2[(Redis Replica)]
+            W[archiver<br/>Spring Boot]
+            DB[(RDS MySQL)]
         end
-        W[Archiver<br/>Redis Stream → DynamoDB/S3]
     end
 
     ALB --> A1 & A2
     A1 & A2 -->|EVALSHA issue.lua| R1
     R1 -. replication .-> R2
-    R1 -->|XREADGROUP| W
-    W --> DDB[(DynamoDB ticket 테이블<br/>영구 보관)]
-    SSM[SSM Session Manager] -.관리 접속.- A1 & R1
-    CW[CloudWatch Agent<br/>로그/지표/알람] -.- A1 & R1
+    W -->|XREADGROUP / XACK| R1
+    W -->|INSERT| DB
 ```
+
+| 구성요소 | 역할 |
+|---|---|
+| ALB | HTTPS 종료, 앱 서버 분산, 헬스체크 |
+| api | JWT 검증, 신청 시간 검증, Redis에 발급 판정 요청, 결과 응답 |
+| Redis Primary | 재고, 발급 명단, 발급 장부의 기준 데이터. 발급 판정 수행 |
+| Redis Replica | Primary 복제. 장애 시 수동 승격 |
+| archiver | Redis Stream의 발급 내역을 MySQL에 저장. HTTP API 없음 |
+| RDS MySQL | 축제 후에도 남는 영구 기록 |
 
 ### 2.1 요청 흐름
 
 ```
-POST /ticket
- 1. ALB → App (HTTP keep-alive)
- 2. App: JWT 검증(HS256) → userId, studentType
- 3. App: 시간대 검증 (KST, Amazon Time Sync로 시간 동기화)
- 4. App: 로컬 "매진 플래그"가 켜져 있으면 Redis 안 가고 즉시 409 SOLD_OUT
- 5. App → Redis: EVALSHA issue.lua  (1 RTT, 원자적)
- 6. 결과에 따라 즉시 응답
-      200 {status: ISSUED, rank: 123}
-      200 {status: ALREADY_ISSUED, rank: 45}
-      409 {status: SOLD_OUT}
-
-GET /ticket   (기존에 비어 있던 조회 API)
- → HGET ticket:issued <userId>
+POST /api/tickets/events/{eventId}
+ 1. ALB → api
+ 2. JWT 검증 → userId, studentType
+ 3. 사용자별 요청 제한 확인
+ 4. 학생 유형별 신청 시간 판정 (결과를 Lua에 전달)
+ 5. Redis Lua 1회 실행
+ 6. 즉시 응답: ISSUED / ALREADY_ISSUED / TICKET-409 / TICKET-410
 ```
 
-### 2.2 Redis 데이터 모델 & Lua 스크립트
+Lua는 "이미 발급" 분기를 가장 먼저 확인합니다. 이미 발급받은 사용자는 신청 시간 밖이나 매진 후에도 자신의 티켓을 받습니다. 같은 이유로 매진 후에도 Lua를 호출하며, 이때는 읽기만 하므로 디스크 쓰기가 발생하지 않습니다.
+
+### 2.2 DB 기록 흐름
+
+```
+Lua (XADD ticket:{eventId}:log) ─▶ archiver: XREADGROUP → INSERT → XACK
+```
+
+- 발급과 장부 기록이 같은 Lua 안에서 실행되어 둘 중 하나만 성공하는 경우가 없습니다.
+- archiver가 재시작되면 `XACK`하지 못한 메시지(PEL)부터 다시 처리합니다.
+- MySQL `user_id + event_id` 유니크 제약으로 재처리해도 한 건만 저장합니다.
+
+### 2.3 Redis 데이터 모델
 
 | Key | 타입 | 용도 |
 |---|---|---|
-| `ticket:{event}:count` | STRING(int) | 발급된 수 (= 마지막 rank) |
-| `ticket:{event}:issued` | HASH | `user_id → "rank|requested_at"` |
-| `ticket:{event}:log` | STREAM | 발급 이벤트 로그 → 아카이버가 DynamoDB로 복사 |
+| `ticket:{eventId}:config` | HASH | 총 수량, 학생 유형별 시간대, 이름 |
+| `ticket:{eventId}:count` | STRING | 발급 수 (= 마지막 순번) |
+| `ticket:{eventId}:issued` | HASH | `userId → "rank|issuedAt"` |
+| `ticket:{eventId}:log` | STREAM | 발급 장부 |
+| `ratelimit:ticket:{userId}` | STRING (TTL) | 사용자별 요청 제한 |
+
+`{eventId}`는 Redis Cluster 해시 태그로도 동작해 같은 이벤트의 키가 한 슬롯에 모입니다.
 
 ```lua
--- issue.lua
 -- KEYS[1]=count, KEYS[2]=issued, KEYS[3]=log
--- ARGV[1]=user_id, ARGV[2]=total, ARGV[3]=requested_at
+-- ARGV[1]=userId, ARGV[2]=total, ARGV[3]=isOpen ('1' 또는 '0')
 local prev = redis.call('HGET', KEYS[2], ARGV[1])
 if prev then
-  return {2, prev}                       -- 이미 발급됨 (멱등)
+  return {2, prev}
 end
-local cnt = tonumber(redis.call('GET', KEYS[1]) or '0')
-if cnt >= tonumber(ARGV[2]) then
-  return {0, ''}                         -- 매진
+
+if ARGV[3] ~= '1' then
+  return {3, ''}
 end
+
+local issued = tonumber(redis.call('GET', KEYS[1]) or '0')
+if issued >= tonumber(ARGV[2]) then
+  return {0, ''}
+end
+
 local rank = redis.call('INCR', KEYS[1])
-local v = rank .. '|' .. ARGV[3]
-redis.call('HSET', KEYS[2], ARGV[1], v)
-redis.call('XADD', KEYS[3], '*', 'user_id', ARGV[1], 'rank', rank, 'at', ARGV[3])
-return {1, v}                            -- 발급 성공
+local now = redis.call('TIME')
+local issuedAt = now[1] .. '.' .. now[2]
+local value = rank .. '|' .. issuedAt
+redis.call('HSET', KEYS[2], ARGV[1], value)
+redis.call('XADD', KEYS[3], '*', 'userId', ARGV[1], 'rank', rank, 'issuedAt', issuedAt)
+return {1, value}
 ```
 
-- Redis는 단일 스레드로 스크립트를 실행하므로 **초과 발급/중복 발급이 구조적으로 불가능**.
-- 쓰기가 일어나는 건 최대 900번(발급 성공 시)뿐 → `appendfsync always`로 설정해도 성능 부담이 거의 없음. 매진 이후 요청은 읽기만 함.
+- 발급 시각은 Redis 서버 시각으로 기록해 앱 서버 시계 차이와 무관하게 순번과 시각의 순서를 맞춥니다.
+- 순번은 Redis 도착 순서입니다. 클라이언트의 클릭 시각은 조작 가능하므로 기준으로 쓰지 않습니다.
+- 쓰기는 발급 성공 시에만 발생하므로 `appendfsync always`를 사용합니다.
 
-### 2.3 인프라 구성 요소
+### 2.4 인프라 구성
 
-| 구분 | 리소스 | 비고 (초안 사양) |
+| 구분 | 리소스 | 사양 / 비고 |
 |---|---|---|
-| 진입점 | ALB (HTTPS 443, HTTP→HTTPS 리다이렉트) | 기존 ACM 인증서 재사용, 가비아 CNAME을 ALB DNS로 변경 |
-| 앱 서버 | Launch Template + ASG (desired 2, min 2) | `c7g.large` (Graviton), Spring Boot 3 + Java 21 가상 스레드, Tomcat accept-count 튜닝 |
-| Redis | EC2 1대 (Primary) [+ Replica 1대 선택] | `m7g.large`, **T 계열(버스트형) 비권장** — CPU 크레딧 고갈 시 지연 폭증 |
-| 스토리지 | Redis용 gp3 EBS (AOF/RDB) | 이벤트 전후 EBS 스냅샷 |
-| 영구 보관 | 기존 DynamoDB `ticket` 테이블 재사용 | 아카이버가 Stream을 읽어 PutItem |
-| 네트워크 | VPC, Public 2 / Private 2 (AZ a, c) | NAT 대신 VPC 엔드포인트 고려 (아래 결정 사항) |
-| 접속 | SSM Session Manager | SSH 키/22번 포트 미사용 |
-| 시크릿 | SSM Parameter Store (SecureString) | `JWT_SECRET`, Redis 비밀번호 |
-| 관측 | CloudWatch Agent, 알람 | 앱 p99, 5xx, Redis 메모리/연결수/CPU |
+| 진입점 | ALB, ACM | HTTPS 443. 오픈 시간대에 LCU 예약 |
+| 앱 서버 | Launch Template + ASG | `c7g.large` 2대. 오픈 전 예약 확장으로 4대 |
+| Redis | EC2 + EBS gp3 | Primary, Replica. 시작 사양 `m7g.large`, 부하 테스트 후 조정 |
+| Archiver | EC2 (Docker) | 1개 |
+| DB | RDS MySQL 8 | `db.t4g.micro`, 단일 AZ, Private Subnet |
+| 네트워크 | VPC, Public 2 / Private 4 | NAT Gateway 1개 |
+| 이미지 | ECR | ARM64 이미지 (Graviton) |
+| 접속 | SSM Session Manager | SSH와 22번 포트 미사용 |
+| 시크릿 | SSM Parameter Store | `JWT_SECRET`, Redis 비밀번호, DB 비밀번호, 내부 API 키 |
+| 관측 | CloudWatch | 앱 로그, ALB 5xx와 지연, 서버 메모리·CPU |
+
+보안그룹은 다음만 허용합니다.
+
+| 대상 | 허용 |
+|---|---|
+| ALB | 인터넷 → 443 |
+| api | ALB → 8080 |
+| Redis | api, archiver, Replica → 6379 |
+| RDS | archiver → 3306 |
 
 ---
 
-## 3. 이 구조를 쓰면 좋은 이유
+## 3. 이 구조의 장점
 
-1. **동기 응답 — 사용자가 결과를 즉시 앎**
-   큐를 거치지 않으니 "접수됨 → 나중에 조회" 대신 요청 한 번에 "발급 완료, 123번" 응답. 비어 있던 조회 API도 `HGET` 한 줄로 끝남.
-2. **Lambda 동시성 한도(429)에서 해방**
-   계정 동시성 1000 + Provisioned Concurrency 관리가 사라짐. 버스트는 앱 서버의 연결 큐(backlog)와 비동기 I/O로 흡수.
-3. **정합성이 구조적으로 보장됨**
-   Lua 스크립트 하나로 중복 체크·재고 체크·발급이 원자적. 기존의 "SQS dedup 5분 이후 재요청 시 counter만 증가" 같은 누수 경로가 없음.
-4. **핫 키 문제 없음**
-   Redis 단일 인스턴스가 초당 10만+ 단순 연산 처리. 6000 req 버스트는 Redis 입장에서 여유로움 → 병목은 앱 서버/ALB로 이동 (수평 확장이 쉬운 쪽).
-5. **지연 시간이 짧고 예측 가능**
-   VPC 내부 sub-ms RTT. 콜드스타트 없음.
-6. **비용 예측 가능**
-   축제 기간에만 띄우고 `terraform destroy` 가능. ElastiCache보다 저렴(동일 사양 기준 EC2가 대략 30~40% 저렴).
-7. **학습/통제 측면**
-   커널 튜닝, Redis 설정, 영속성 전략을 직접 다룸 — 프로젝트 보고서/포트폴리오 포인트로도 좋음.
+1. **즉시 응답**: 사용자가 요청 한 번으로 발급 결과와 순번을 받습니다.
+2. **Lambda 동시성 한도 제거**: 버스트는 앱 서버의 연결 대기열과 가상 스레드로 흡수합니다.
+3. **구조적인 정합성**: 판정이 Lua 안에서 원자적으로 끝나 초과 발급과 중복 발급이 발생하지 않습니다.
+4. **단일 카운터 병목 해소**: 판정은 메모리에서 수십 μs 안에 끝나고, 병목은 수평 확장이 쉬운 앱 서버 쪽으로 이동합니다.
+5. **요청 경로와 기록 경로 분리**: 사용자 응답은 DB 쓰기를 기다리지 않습니다.
+6. **직접 운영 경험**: Redis 설정, 영속성, 복제, 장애 대응을 직접 다룹니다. EC2에 직접 올린 이유이며, 비용 절감이 목적은 아닙니다.
 
-## 4. 단점 / 리스크
+## 4. 단점과 대응
 
-| 단점 | 영향 | 완화책 |
+| 단점 | 영향 | 대응 |
 |---|---|---|
-| **Redis 단일 장애점(SPOF)** | Primary 다운 = 발급 중단 | Replica + 수동 승격 런북, 또는 Sentinel 3노드. 짧은 이벤트라면 "빠른 재기동 + AOF 복구"도 현실적 |
-| **인메모리 데이터 유실 위험** | 장애 시 발급 기록 유실 | `appendfsync always` + Stream → DynamoDB 아카이빙 + EBS 스냅샷 |
-| **운영 부담 전부 내 몫** | 패치, 설정, 모니터링, 장애 대응 | AMI/user_data로 재현 가능하게, SSM으로 접속, 체크리스트화 |
-| **자동 확장이 느림** | EC2 부팅 수 분 → 순간 버스트에 ASG가 못 따라감 | 오픈 시각이 정해져 있으므로 **미리 증설(scheduled scaling)** |
-| **ALB 콜드 상태** | 갑작스러운 수천 RPS에 초기 5xx 가능 | ALB LCU 예약(Capacity Reservation) 또는 사전 워밍 트래픽 |
-| **보안 책임** | Redis가 외부 노출되면 즉시 탈취 | Private subnet, SG는 앱 SG에서만 6379 허용, `requirepass`/ACL, 위험 명령 rename |
-| **상시 비용** | 서버리스와 달리 놀고 있어도 과금 | 이벤트 기간 외엔 destroy / stop |
-| **NAT Gateway 비용** | 시간당 + 데이터 처리 비용 | VPC 엔드포인트(S3 Gateway, SSM, CloudWatch, DynamoDB Gateway)로 대체 |
+| Redis 단일 장애점 | Primary 장애 시 발급 중단 | Replica 수동 승격 런북, 앱의 빠른 실패(503) |
+| 비동기 복제 | 장애 전환 시 복제되지 않은 발급 유실 가능 | AOF `always`, Primary 복구 우선, archiver 저장분과 대조 |
+| 메모리 기반 처리 | 처리 중인 요청은 서버 장애 시 사라짐 | 발급이 멱등이라 클라이언트 재시도로 복구 |
+| 운영 부담 | 패치, 설정, 모니터링 | 코드화된 프로비저닝, SSM, 런북 |
+| 느린 자동 확장 | 수 분 걸려 버스트에 대응 불가 | 오픈 전 예약 확장 |
+| ALB 확장 속도 | 급격한 트래픽에 초기 5xx 가능 | LCU 예약 |
+| 보안 책임 | Redis 노출 시 데이터 탈취 | Private Subnet, 보안그룹, 비밀번호/ACL |
+| 상시 비용 | 사용하지 않아도 과금 | 행사 기간 외 `terraform destroy` |
 
 ---
 
-## 5. 추가로 필요한 구성 (기존엔 AWS가 해주던 것들)
+## 5. 운영 설정
 
-1. **VPC 네트워크 직접 구성** — 서브넷, 라우팅, IGW, (NAT 또는 VPC 엔드포인트), 보안그룹 3종(ALB / App / Redis)
-2. **ALB + Target Group + 헬스체크** (`GET /health`가 Redis PING까지 확인)
-3. **앱 서버 애플리케이션** — Lambda 핸들러 로직을 Spring Boot로 재작성 (jjwt로 JWT 검증, 시간대/CORS 로직 이식)
-   - Redis 커넥션 풀, `EVALSHA` + `NOSCRIPT` 시 재로드
-   - 매진 로컬 플래그 (Redis Pub/Sub 또는 응답 기반)
-4. **앱 배포 방식** — S3에 코드 업로드 후 user_data에서 가져오기 / Docker + ECR 중 택1
-5. **Redis 서버 프로비저닝 (user_data)**
-   - `vm.overcommit_memory=1`, THP 비활성화, `net.core.somaxconn`, `ulimit -n`
-   - `redis.conf`: `bind <private-ip>`, `protected-mode yes`, `requirepass`, `appendonly yes`, `appendfsync always`, `maxmemory` + `noeviction`
-6. **아카이버 워커** — Redis Stream 소비 → DynamoDB 기록 (Redis EC2에 systemd 서비스로 같이 띄우거나 App에 포함)
-7. **IAM 인스턴스 프로파일** — SSM, CloudWatch, Parameter Store 읽기, DynamoDB PutItem
-8. **모니터링/알람** — CloudWatch Agent(메모리·디스크), 앱 로그 전송, Redis `INFO` 지표 수집
-9. **운영 스크립트 교체**
-   - `reset.sh`: SQS purge/DynamoDB 삭제 → Redis 키 삭제 + 재고 초기화
-   - `verify.sh`: `HLEN issued == count <= 900` 검증
-   - 장애 런북: Replica 승격, AOF 복구 절차
-10. **부하테스트 재사용** — `terraform-loadtest`(k6 EC2)는 그대로 쓰고 `API_URL`만 ALB 도메인으로 변경
-11. **DNS 전환** — 가비아 CNAME을 API Gateway → ALB DNS로 변경
+### 5.1 앱 서버
+
+| 설정 | 값 | 이유 |
+|---|---|---|
+| `spring.threads.virtual.enabled` | `true` | Redis 응답 대기 중 스레드 부족 방지 |
+| `server.tomcat.accept-count` | 2000 | 버스트 시 연결 거부 방지. OS `somaxconn`도 함께 상향 |
+| `server.tomcat.max-connections` | 10000 | 서버당 수천 개 동시 연결 수용 |
+| Lettuce `timeout` | 500ms | 기본 60초로는 Redis 장애 시 요청이 오래 매달림 |
+| 서킷브레이커 | Resilience4j | Redis 장애가 앱 서버 장애로 번지지 않게 즉시 503 |
+| JVM 워밍업 | 오픈 5분 전 트래픽 | JIT 최적화 전의 초기 지연 완화 |
+
+### 5.2 Redis 서버
+
+| 설정 | 이유 |
+|---|---|
+| `appendonly yes`, `appendfsync always` | 발급 기록 영속화 |
+| `maxmemory-policy noeviction` | 발급 데이터가 임의로 삭제되지 않게 함 |
+| `bind`, `protected-mode`, `requirepass` | 접근 제한 |
+| `vm.overcommit_memory=1` | 백그라운드 저장(fork) 실패 방지 |
+| Transparent Huge Pages 비활성화 | fork 이후 지연 방지 |
+| `net.core.somaxconn`, `ulimit -n` 상향 | 연결 수 확보 |
+
+### 5.3 장애 대응
+
+- 앱은 Redis를 IP가 아닌 고정 사설 DNS 이름으로 접속해, Replica 승격 시 DNS만 변경합니다.
+- 런북: Primary 장애 판단 → Replica `REPLICAOF NO ONE` → DNS 전환 → archiver 재연결 확인 → 발급 수와 MySQL 건수 대조.
+- 문제가 지속되면 이전 서비스로 돌아갈 수 있도록 DNS 전환 절차를 준비합니다.
+
+### 5.4 행사 당일 순서
+
+1. 오픈 30분 전: ASG 예약 확장, ALB LCU 예약 확인
+2. 오픈 5분 전: JVM 워밍업 트래픽
+3. 오픈: 대시보드 확인 (ALB 5xx, 응답 시간, Redis CPU·연결 수, archiver 미처리 수)
+4. 마감 후: 발급 수와 MySQL 건수 대조, 용량 원복
 
 ---
 
-## 6. 결정 필요 사항 (논의 포인트)
+## 6. 결정 사항
 
-| # | 질문 | 선택지 | 제안 |
-|---|---|---|---|
-| D1 | Redis 가용성 | (a) 단일 인스턴스 (b) Primary+Replica 수동 승격 (c) Sentinel 3노드 | **(b)** — 비용 대비 균형, 승격 런북만 준비 |
-| D2 | 영구 저장소 | (a) Redis만 (AOF/RDB) (b) + Stream→DynamoDB 아카이빙 (c) + RDS | **(b)** — 기존 테이블 재사용, 데이터 유실 대비 |
-| D3 | 앱 서버 프레임워크 | (a) Python FastAPI (b) Spring Boot (c) Node | **✅ 확정: (b) Spring Boot 3 + Java 21** — Lettuce + RedisScript, 가상 스레드 |
-| D4 | 앱 배포 | (a) S3 + user_data (b) Docker + ECR | **(b)** — 로컬/EC2 동일 환경, 롤링 교체 쉬움 |
-| D5 | 아웃바운드 | (a) NAT Gateway (b) VPC 엔드포인트만 (c) App을 Public subnet에 | **(b)** — 비용 절감 (단 Docker 이미지는 ECR 엔드포인트 필요) |
-| D6 | 큐/대기열 | (a) 없음, 직접 발급 (b) Redis ZSET 대기열 + 폴링 | **(a)** — 900장 규모엔 대기열이 오히려 복잡도만 추가 |
-| D7 | 진입점 | (a) ALB (b) 기존 API Gateway → VPC Link → NLB | **(a)** — 단순, API GW 스로틀링도 같이 제거 |
-| D8 | 인스턴스 사양 | App `c7g.large`×2, Redis `m7g.large`×(1~2) | 부하테스트 후 조정 |
+| # | 항목 | 결정 |
+|---|---|---|
+| D1 | Redis 가용성 | Primary + Replica, 수동 승격 |
+| D2 | 영구 저장 | Redis Streams → archiver → RDS MySQL |
+| D3 | 앱 프레임워크 | Spring Boot 4, Java 21 |
+| D4 | 앱 배포 | Docker + ECR |
+| D5 | 아웃바운드 | NAT Gateway 1개 |
+| D6 | 대기열 | 사용하지 않음. 동시 접속이 앱 서버 수용량을 넘는 규모가 되면 Sorted Set 대기실 추가 |
+| D7 | 진입점 | ALB |
+| D8 | 초기 사양 | App `c7g.large`, Redis `m7g.large`, RDS `db.t4g.micro`. 부하 테스트 후 조정 |
+| D9 | 인증 | Spring Security 없이 Filter와 ArgumentResolver로 JWT 검증 |
 
 ---
 
-## 7. 새 폴더 구조 (예정)
+## 7. 프로젝트 구조
 
 ```
-festival_ticketing_redis/
-├── docs/ARCHITECTURE.md      ← 이 문서
-├── app/                      # Spring Boot 앱 (Gradle) + issue.lua + Dockerfile
-├── archiver/                 # Stream → DynamoDB 워커
-├── redis/                    # redis.conf, sysctl, user_data
-├── terraform/                # vpc, alb, asg, redis_ec2, iam, ssm, endpoints, outputs
-└── loadtest/                 # k6 스크립트, reset.sh, verify.sh (Redis용)
+second_festival_ticketing_server/
+├── docs/
+├── api/                # 발급·조회 API
+├── archiver/           # Stream → MySQL 저장 워커
+├── docker-compose.yml  # 로컬 Redis, MySQL
+├── terraform/          # 인프라
+└── loadtest/           # k6 부하 테스트
 ```
