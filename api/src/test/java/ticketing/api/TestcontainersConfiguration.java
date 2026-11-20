@@ -1,4 +1,4 @@
-package kr.ac.kau.festival.ticketing.api;
+package ticketing.api;
 
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
