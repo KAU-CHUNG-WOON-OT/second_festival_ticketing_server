@@ -40,6 +40,7 @@ bin/
 *.pem
 *.key
 application-local.yml
+http-client.private.env.json
 
 ### Terraform ###
 **/.terraform/

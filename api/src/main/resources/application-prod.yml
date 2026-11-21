@@ -1,0 +1,8 @@
+# 운영 프로필 (SPRING_PROFILES_ACTIVE=prod)
+
+# API 구조를 외부에 노출하지 않도록 Swagger 문서와 UI를 끈다
+springdoc:
+  api-docs:
+    enabled: false
+  swagger-ui:
+    enabled: false

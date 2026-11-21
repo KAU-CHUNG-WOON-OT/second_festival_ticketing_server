@@ -31,6 +31,20 @@ docker compose up -d          # redis, mysql 실행
 ./gradlew :archiver:bootRun
 ```
 
+## API 확인
+
+- **Swagger UI**: 서버 실행 후 http://localhost:8080/swagger-ui.html (`prod` 프로필에서는 꺼짐)
+- **테스트 토큰**: 인증 서버 없이 `.env`의 `JWT_SECRET`으로 Access Token을 만든다
+
+  ```bash
+  ./scripts/issue-test-token.sh                 # userId=1, UNDERGRADUATE
+  ./scripts/issue-test-token.sh 42 ON_LEAVE 600 # userId, 학생 유형, 유효 시간(초)
+  ```
+
+  Swagger의 **Authorize** 버튼에 붙여넣으면 자물쇠가 있는 API를 호출할 수 있다.
+- **요청 파일**: `http/tickets.http` (IntelliJ HTTP Client). 토큰은 `http/http-client.private.env.json`에 넣는다 (예시 파일 복사, 커밋 제외)
+- **명세**: [docs/API.md](docs/API.md)
+
 ## 테스트
 
 Testcontainers를 사용하므로 Docker가 실행 중이어야 한다.
