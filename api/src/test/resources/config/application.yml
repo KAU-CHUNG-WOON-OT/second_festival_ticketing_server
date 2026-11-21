@@ -1,0 +1,4 @@
+# 테스트 전용 설정. main의 application.yml 위에 덮어쓴다 (classpath:/config/ 가 우선순위가 높다)
+jwt:
+  secret: test-secret-for-ticketing-api-must-be-at-least-64-bytes-long-to-allow-hs512
+  issuer: auth-backend
