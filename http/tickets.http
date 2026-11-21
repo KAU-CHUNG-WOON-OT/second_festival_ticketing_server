@@ -1,0 +1,40 @@
+### 티켓팅 API 요청 모음 (IntelliJ HTTP Client)
+# 1. cp http/http-client.private.env.json.example http/http-client.private.env.json
+# 2. ./scripts/issue-test-token.sh 로 만든 토큰을 token 값에 붙여넣기
+# 3. 오른쪽 위 환경 선택에서 local을 고르고 ▶ 실행
+# 명세: docs/API.md
+
+### 헬스체크
+GET {{baseUrl}}/actuator/health
+
+### 티켓팅 일정 조회 (로그인 불필요)
+GET {{baseUrl}}/api/tickets/events
+
+### 티켓 발급
+POST {{baseUrl}}/api/tickets/events/{{eventId}}
+Authorization: Bearer {{token}}
+
+### 티켓 발급: 같은 사람이 다시 요청하면 ALREADY_ISSUED (200)
+POST {{baseUrl}}/api/tickets/events/{{eventId}}
+Authorization: Bearer {{token}}
+
+### 티켓 발급: 휴학생은 더 늦게 열려서 오픈 전이면 409 TICKET-409
+POST {{baseUrl}}/api/tickets/events/{{eventId}}
+Authorization: Bearer {{onLeaveToken}}
+
+### 티켓 발급: 토큰 없음 401 AUTH-402
+POST {{baseUrl}}/api/tickets/events/{{eventId}}
+
+### 티켓 발급: 없는 이벤트 404 TICKET-404
+POST {{baseUrl}}/api/tickets/events/no-such-event
+Authorization: Bearer {{token}}
+
+### 내 티켓 조회
+GET {{baseUrl}}/api/tickets/me
+Authorization: Bearer {{token}}
+
+### CORS 사전 요청 (프론트 개발 서버에서 호출하는 상황)
+OPTIONS {{baseUrl}}/api/tickets/me
+Origin: http://localhost:5173
+Access-Control-Request-Method: GET
+Access-Control-Request-Headers: Authorization
